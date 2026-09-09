@@ -1,0 +1,30 @@
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: router-backend-config
+  namespace: default
+spec:
+  timeoutSec: 3600
+  connectionDraining:
+    drainingTimeoutSec: 60
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: enterprise-agentic-router-ingress
+  namespace: default
+  annotations:
+    kubernetes.io/ingress.class: "gce"
+    # Links GCP GCE Load Balancer to BackendConfig for extended WebSocket timeout
+    cloud.google.com/backend-config: '{"default": "router-backend-config"}'
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /ws/*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: router-service
+            port:
+              number: 8000

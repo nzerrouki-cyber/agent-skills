@@ -1,78 +1,84 @@
+# agents/intake_agent.py
+from google.genai import types
+from agents.base_agent import BaseAgent
+from config.settings import settings
 from services.session_store import SessionStoreService
 from services.intake_webhook import IntakeWebhookService
-from google import genai
-from config.settings import settings
+from models.schemas import IntakeSessionState, SessionStatus
 
-class IntakeAgent:
-    # Question Sequence Definition
-    # This is just a protype for the questions the IntakeAgent will ask the user.
-    INTAKE_QUESTIONS = [
-        {"turn": 0, "field": "core_idea", "prompt": "Welcome! Please describe your Core Purpose & Target Audience."},
-        {"turn": 1, "field": "input_types", "prompt": "What types of input data, files, or user requests will this system process?"},
-        {"turn": 2, "field": "category_domain", "prompt": "Which domain category does this belong to? (e.g., Security, Architecture, SCM SOP)"},
-        {"turn": 3, "field": "output_requirements", "prompt": "What specific output formatting or callouts are required?"}
-    ]
-
-    # Categories that each intake idea will be mapped to.
-    CATEGORY_DATASTORE_MAP = {
-        "Security & Compliance": "ciso-policy-ds",
-        "Architecture Review": "csa-template-ds",
-        "Supply Chain SOP": "scm-sop-ds"
-    }
+class IntakeAgent(BaseAgent):
+    """Stateful WebSocket Intake Agent guiding users through innovation intake questions."""
 
     def __init__(self):
-        self.session_store = SessionStoreService()
+        super().__init__()
+        self.session_store = SessionStoreService(
+            collection_name=settings.FIRESTORE_INTAKE_SESSION_STORE
+        )
         self.webhook_service = IntakeWebhookService()
-        self.ai_client = genai.Client()
 
-    async def process_active_turn(self, session_id: str, user_input: str) -> str:
-        """Processes one active turn in the intake loop."""
-        session = await self.session_store.get_session(session_id)
+    async def _get_intake_system_instruction(self) -> str:
+        """Retrieves promoted Intake System Skill directly from Production GCS / Redis."""
+        prompt_content, _, _ = await self.get_promoted_skill_prompt("SKILL_INTAKE")
+        return prompt_content
 
-        if session.status == "COMPLETED":
-            return "This intake session is already completed and submitted."
+    async def handle_user_message(self, session_id: str, user_message: str) -> dict:
+        """Processes a chat turn over WebSockets, persisting session state and executing completion handoffs."""
+        session: IntakeSessionState = await self.session_store.get_session(session_id)
+        system_instruction = await self._get_intake_system_instruction()
 
-        current_turn = session.current_turn
-        question_config = self.INTAKE_QUESTIONS[current_turn]
+        history_context = "\n".join([
+            f"{msg.sender.upper()}: {msg.content}" for msg in session.conversation_history
+        ])
+        user_prompt = f"CONVERSATION HISTORY:\n{history_context}\n\nUSER INPUT:\n{user_message}"
 
-        # 1. Update collected fields with current turn response
-        session.collected_fields[question_config["field"]] = user_input
-
-        # 2. Check if more questions remain
-        next_turn = current_turn + 1
-        if next_turn < len(self.INTAKE_QUESTIONS):
-            next_prompt = self.INTAKE_QUESTIONS[next_turn]["prompt"]
-            
-            # Save progress to Live Chat Session Store
-            await self.session_store.update_turn(
-                session_id=session_id,
-                user_message=user_input,
-                agent_response=next_prompt,
-                next_turn=next_turn,
-                updated_fields=session.collected_fields
+        response = await self.genai_client.aio.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=user_prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.2
             )
-            return next_prompt
-        else:
-            # 3. Finalize Intake Process
-            return await self._finalize_intake(session)
-
-    async def _finalize_intake(self, session: IntakeSessionState) -> str:
-        """Categorizes submission, updates status to COMPLETED, and triggers handoff."""
-        category = session.collected_fields.get("category_domain", "Architecture Review")
-        target_datastore_id = self.CATEGORY_DATASTORE_MAP.get(category, "default-ds")
-
-        # Mark completed in Session Store
-        await self.session_store.mark_completed(
-            session_id=session.session_id,
-            category=category,
-            target_datastore_id=target_datastore_id
         )
 
-        # Trigger Webhook/Cloud Function to serialize to markdown and push to GCS
-        await self.webhook_service.convert_and_upload(
-            session_id=session.session_id,
-            fields=session.collected_fields,
-            category=category
+        agent_reply = response.text or ""
+        next_turn = session.current_turn + 1
+
+        # Extract any metadata provided by user or agent turn.
+        extracted_meta = self.extract_header_metadata(f"{user_message}\n{agent_reply}")
+        updated_collected_fields = {**session.collected_fields, **extracted_meta}
+        
+        # Updates session, conversation history and active chat turn session.
+        await self.session_store.update_turn(
+            session_id=session_id,
+            user_message=user_message,
+            agent_response=agent_reply,
+            next_turn=next_turn,
+            updated_fields=updated_collected_fields
         )
 
-        return f"Thank you! Your intake submission is complete. Category assigned: '{category}'. Submission file generated and queued for processing."
+        # Enforce exact status sentinel matching to prevent premature handoff.
+        is_completed = "[STATUS: COMPLETED]" in agent_reply
+        # Once session is complete, the intake and category is stored and pushed to intake GCS via webhook function.
+        if is_completed:
+            target_ds = updated_collected_fields.get("target_datastore_id", "default-ds")
+            category = updated_collected_fields.get("category", "Architecture Review")
+
+            await self.session_store.mark_completed(
+                session_id=session_id,
+                category=category,
+                target_datastore_id=target_ds
+            )
+
+            await self.webhook_service.convert_and_upload(
+                session_id=session_id,
+                fields=updated_collected_fields,
+                target_datastore_id=target_ds,
+                category=category
+            )
+
+        return {
+            "reply": agent_reply,
+            "session_id": session_id,
+            "turn": next_turn,
+            "status": SessionStatus.COMPLETED.value if is_completed else SessionStatus.IN_PROGRESS.value
+        }

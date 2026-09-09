@@ -1,55 +1,60 @@
- # <skill_id, generation_id, target_datastore_id, skill_gcs_uri, intake_uri>
-from services.firestore_client import FirestoreClient
+# agents/discovery_agent.py
+# <skill_id, generation_id, target_datastore_id, skill_gcs_uri, intake_uri>
+from agents.base_agent import BaseAgent
+from models.schemas import TaskPayload
 from services.cloud_tasks import CloudTasksClient
-from services.gcs_service import GCSService
 from services.model_armor import ModelArmorClient
-from models.schemas import TaskPayload 
 
-class DiscoveryAgent:
+class DiscoveryAgent(BaseAgent):
+    """Event-driven routing agent using AisleSkill metadata for registry lookups."""
+
     def __init__(self):
-        self.firestore = FirestoreClient()
+        super().__init__()
         self.task_queue = CloudTasksClient()
-        # Instantiate GCS and Model Armor services
-        self.gcs_service = GCSService()
         self.model_armor = ModelArmorClient()
-        
+
+    # Emits an eventarc trigger after an intake is added, discoveyr agent retrieves skil and enqueues task for the worker agent.
     async def process_and_enqueue(self, event_payload: dict):
-        """Processes GCS event, sanitizes input, categorizes, fetches skill, and queues task."""
-        
-        # 1. Parse Intake URI from the Eventarc payload
-        bucket = event_payload.get("bucket")
-        name = event_payload.get("name")
-        intake_uri = f"gs://{bucket}/{name}"
-        
-        # 2. Download the raw Markdown text using GCSService
-        raw_intake_text = await self.gcs_service.download_blob_as_text(bucket, name)
-        
-        # 3. Sanitize the text using Model Armor
-        sanitization_result = await self.model_armor.sanitize_payload(raw_intake_text)
-        if not sanitization_result.is_safe:
-            raise ValueError(f"Malicious payload detected in {intake_uri}")
+        """Processes Eventarc GCS events, runs security checks, resolves active skills, and enqueues tasks."""
+        bucket, name = self.extract_gcs_event_data(event_payload)
+        raw_text = await self.gcs_service.download_blob_as_text(bucket, name)
 
-        # 4. Categorize the Intake using the sanitized text
-        category = await self._categorize_submission(sanitization_result.clean_text)
-        
-        # 5. Retrieve Promoted Skill from the Skill Index Registry (Firestore)
-        skill_record = await self.firestore.get_active_skill_by_category(category)
-        
+        # 1. Extract metadata (skill_id or target_datastore_id) from intake header
+        metadata = self.extract_header_metadata(raw_text)
+        explicit_skill_id = metadata.get("skill_id")
+        datastore_id = metadata.get("target_datastore_id", "default-ds")
+
+        # 2. Sanitize payload via Model Armor
+        sanitized = await self.model_armor.sanitize_payload(raw_text)
+        if not sanitized.is_safe:
+            raise ValueError(f"Malicious payload detected in gs://{bucket}/{name}")
+
+        # 3. Registry Lookup: Check explicit skill_id first, fallback to target_datastore_id
+        skill_record = None
+        if explicit_skill_id:
+            skill_record = await self.firestore.get_active_skill_by_id(explicit_skill_id)
+
         if not skill_record:
-            raise ValueError(f"No promoted skill found in registry for category: {category}")
+            skill_record = await self.firestore.get_active_skill_by_datastore(datastore_id)
 
-        # 6. Construct the precise TaskPayload required by the Worker Pod
+        if not skill_record:
+            raise ValueError(
+                f"No active skill registered in Firestore for skill_id: '{explicit_skill_id}' "
+                f"or target_datastore_id: '{datastore_id}'"
+            )
+
+        # 4. Build TaskPayload with immutable skill pointers and metadata
         payload = TaskPayload(
             skill_id=skill_record["skill_id"],
-            generation_id=skill_record["generation_id"],
-            target_datastore_id=skill_record["target_datastore_id"],
+            generation_id=str(skill_record["generation_id"]),
+            target_datastore_id=skill_record.get("target_datastore_id", datastore_id),
+            output_schema=skill_record.get("output_schema", "InnovationIntakeResult"),
             skill_gcs_uri=skill_record["gcs_uri"],
-            intake_uri=intake_uri
+            intake_content=sanitized.clean_text
         )
-        
-        # 7. Enqueue to the Cloud Tasks throttled queue
+
+        # 5. Dispatch to Cloud Tasks worker queue
         await self.task_queue.enqueue_worker_task(
-            queue_name="worker-dispatch-queue",
-            endpoint=f"/worker/{category}",
+            endpoint_route=f"/worker/{payload.target_datastore_id}",
             payload=payload.model_dump()
         )
