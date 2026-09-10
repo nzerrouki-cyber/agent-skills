@@ -1,34 +1,34 @@
 # worker_main.py
-import logging
-from fastapi import FastAPI, HTTPException, Status
-from models.schemas import TaskPayload
+from fastapi import FastAPI, Depends, HTTPException
 from agents.worker_agent import WorkerAgent
-
-logger = logging.getLogger("worker_main")
+from models.schemas import TaskPayload
+from utils.security import verify_cloud_tasks_oidc_token
+from utils.logger import logger
 
 app = FastAPI(title="Enterprise Agentic Workflow - Worker Service", version="1.0.0")
 
 
-@app.get("/health", status_code=Status.HTTP_200_OK)
+@app.get("/health")
 async def health_check():
-    """GKE / Cloud Run liveness probe endpoint."""
+    """Health check probe endpoint for worker pods."""
     return {"status": "healthy"}
 
-# 1. Retrieves appropriate skill.
-# 2. Executes RAG to retrieve the correct knowledge files to execute the worker task.
-# 3. Streams the final output to the BigQuery Database.
-@app.post("/worker/{datastore_id}")
-async def execute_worker_task(datastore_id: str, payload: TaskPayload):
-    """Pulls mapped skill, executes RAG against target_datastore_id, and streams output to BigQuery."""
-    worker = WorkerAgent(category=datastore_id)
-    
+
+@app.post("/worker/{target_datastore_id}")
+async def execute_worker_task(
+    target_datastore_id: str,
+    payload: TaskPayload,
+    auth_claims: dict = Depends(verify_cloud_tasks_oidc_token)
+):
+    """
+    Stateless worker task endpoint invoked asynchronously by Cloud Tasks.
+    Protected via OIDC token verification.
+    """
+    logger.info(f"Worker task received for datastore: '{target_datastore_id}'", extra={"skill_id": payload.skill_id})
     try:
+        worker = WorkerAgent(category=target_datastore_id)
         result = await worker.execute_task(payload)
-        return {"status": "Success", "audit_result": result}
+        return {"status": "SUCCESS", "skill_id": payload.skill_id, "result": result}
     except Exception as e:
-        logger.error(f"Worker task execution failed for datastore '{datastore_id}': {str(e)}", exc_info=True)
-        # HTTP 500 status code triggers Cloud Tasks automatic retries
-        raise HTTPException(
-            status_code=Status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Worker execution failed. Task will be retried by Cloud Tasks."
-        )
+        logger.error(f"Worker task execution failed: {str(e)}", extra={"skill_id": payload.skill_id})
+        raise HTTPException(status_code=500, detail=f"Worker execution failed: {str(e)}")

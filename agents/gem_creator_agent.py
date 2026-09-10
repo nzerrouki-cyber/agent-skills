@@ -5,19 +5,20 @@ from google.genai import types
 from agents.base_agent import BaseAgent
 from config.settings import settings
 from services.session_store import SessionStoreService
+from services.discovery_engine import DiscoveryEngineService
 from models.schemas import IntakeSessionState, AisleSkill
 
 
 class GemCreatorAgent(BaseAgent):
-    """Interactive Gem Authoring Agent inheriting shared GCP setups from BaseAgent."""
+    """Interactive Gem Authoring Agent using Vertex AI Data Store RAG for skill baselines."""
 
     def __init__(self):
         super().__init__()
         self.session_store = SessionStoreService(
             collection_name=settings.FIRESTORE_GEM_CREATOR_SESSION_STORE
         )
+        self.discovery_engine = DiscoveryEngineService()
 
-    # Retrieve the gem creator's skill from Production GCS / Redis cache for it to use in the SKILL Lifecycle.
     async def _get_gem_creator_system_instruction(self) -> str:
         """Retrieves promoted Gem Creator Meta-Skill directly from Production GCS / Redis."""
         prompt_content, _, _ = await self.get_promoted_skill_prompt("SKILL_GEM_CREATOR")
@@ -27,15 +28,30 @@ class GemCreatorAgent(BaseAgent):
         clean_session = re.sub(r'[^a-zA-Z0-9]', '_', session_id).upper()
         return f"SKILL_GEM_{clean_session[:12]}"
 
-    # Processes user and gem creator information, and stores active conversation history
     async def process_intake_pathway(self, session_id: str, user_payload: str) -> str:
         session: IntakeSessionState = await self.session_store.get_session(session_id)
         system_instruction = await self._get_gem_creator_system_instruction()
 
+        # 1. Dynamic RAG query against Vertex AI Search Data Store for reference skill baselines
+        reference_skill_context = await self.discovery_engine.search_datastore(
+            datastore_id="system-core-ds",
+            query_text=user_payload,
+            top_k=3
+        )
+
         history_context = "\n".join([
             f"{msg.sender.upper()}: {msg.content}" for msg in session.conversation_history
         ])
-        user_prompt = f"CONVERSATION HISTORY:\n{history_context}\n\nCURRENT ACTIVE USER PAYLOAD:\n{user_payload}"
+
+        # 2. Inject retrieved skill context into model prompt
+        user_prompt = f"""CONVERSATION HISTORY:
+{history_context}
+
+RETRIEVED REFERENCE SKILL BASELINES (FROM VERTEX AI DATASTORE):
+{reference_skill_context}
+
+CURRENT ACTIVE USER PAYLOAD:
+{user_payload}"""
 
         response = await self.genai_client.aio.models.generate_content(
             model='gemini-2.5-flash',
@@ -63,7 +79,6 @@ class GemCreatorAgent(BaseAgent):
 
         # Extract generated markdown block using BaseAgent utility
         raw_skill_md = self.extract_markdown_block(agent_reply)
-        # If it is an incoming skill, it extracts the important SKILL metadata.
         if raw_skill_md:
             skill_id = extracted_meta.get("skill_id") or self._generate_fallback_skill_id(session_id)
             
@@ -75,7 +90,7 @@ class GemCreatorAgent(BaseAgent):
             title = extracted_meta.get("title") or updated_collected_fields.get("title", skill_id.replace("_", " ").title())
             description = extracted_meta.get("description") or updated_collected_fields.get("description", "")
 
-            # Only add the skill to the Drafts GCS if target_datastore_id and category have been gathered
+            # Write draft to GCS if target_datastore_id and category have been gathered
             if target_ds and category:
                 skill_contract = AisleSkill(
                     skill_id=skill_id,
@@ -97,7 +112,6 @@ class GemCreatorAgent(BaseAgent):
                 prefix = bucket_parts[1] if len(bucket_parts) > 1 else ""
                 blob_path = f"{prefix}/{skill_id}.md" if prefix else f"{skill_id}.md"
 
-                # Upload to Drafts GCS to be validated by validation agent.
                 await self.gcs_service.upload_string(
                     bucket_name=bucket_name,
                     blob_name=blob_path,
