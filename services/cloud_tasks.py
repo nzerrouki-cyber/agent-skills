@@ -14,7 +14,6 @@ class CloudTasksClient(BaseService):
             self.project_id, self.region, settings.TASK_QUEUE_NAME
         )
 
-    # Retrieves the skill payload from the discovery agent and routes it to the proper worker agent
     async def enqueue_worker_task(self, endpoint_route: str, payload: dict) -> str:
         """Builds the HTTP task with URL-encoded route paths and enqueues it to Cloud Tasks."""
         clean_route = endpoint_route.lstrip("/")
@@ -25,6 +24,13 @@ class CloudTasksClient(BaseService):
         base_url = settings.WORKER_SERVICE_URL.rstrip("/")
         url = f"{base_url}/{encoded_route}"
 
+        # Binds service account email dynamically from settings for Cloud Run OIDC
+        service_account_email = getattr(
+            settings, 
+            "WORKER_SERVICE_ACCOUNT_EMAIL", 
+            f"worker-invoker@{self.project_id}.iam.gserviceaccount.com"
+        )
+
         task = {
             "http_request": {
                 "http_method": tasks_v2.HttpMethod.POST,
@@ -32,7 +38,7 @@ class CloudTasksClient(BaseService):
                 "headers": {"Content-Type": "application/json"},
                 "body": json.dumps(payload).encode("utf-8"),
                 "oidc_token": {
-                    "service_account_email": f"worker-invoker@{self.project_id}.iam.gserviceaccount.com"
+                    "service_account_email": service_account_email
                 },
             }
         }

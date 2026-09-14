@@ -10,7 +10,7 @@ class GCSService(BaseService):
         self.storage_client = storage.Client(project=self.project_id)
 
     async def download_blob_as_text(self, bucket_setting: str, blob_name: str) -> str:
-        """Downloads a blob from GCS asynchronously, handling gs:// prefixes in bucket settings."""
+        """Downloads a blob from GCS asynchronously."""
         bucket_name, _ = self.clean_gcs_bucket_and_prefix(bucket_setting)
         bucket = self.storage_client.bucket(bucket_name)
         blob = bucket.blob(blob_name)
@@ -18,20 +18,28 @@ class GCSService(BaseService):
         return text_bytes.decode("utf-8")
 
     async def download_from_uri(self, uri: str) -> str:
-        """Parses a gs:// URI (stripping fragments if present) and downloads content."""
+        """Parses a gs:// URI and downloads content."""
         bucket_name, blob_name = self.parse_gcs_uri(uri)
         return await self.download_blob_as_text(bucket_setting=bucket_name, blob_name=blob_name)
 
-    async def upload_string(self, bucket_setting: str, blob_name: str, content: str, content_type: str = "text/plain"):
-        """Uploads a string to GCS asynchronously, handling gs:// prefixes in bucket settings."""
+    async def upload_string(
+        self, 
+        bucket_setting: str, 
+        blob_name: str, 
+        content: str, 
+        content_type: str = "text/plain"
+    ) -> str:
+        """Uploads a string to GCS asynchronously and returns the unique Generation ID."""
         bucket_name, _ = self.clean_gcs_bucket_and_prefix(bucket_setting)
         bucket = self.storage_client.bucket(bucket_name)
         blob = bucket.blob(blob_name)
-        await asyncio.to_thread(
-            blob.upload_from_string,
-            content,
-            content_type=content_type
-        )
+
+        def _execute_upload():
+            blob.upload_from_string(content, content_type=content_type)
+            blob.reload()
+            return str(blob.generation)
+
+        return await asyncio.to_thread(_execute_upload)
 
     async def copy_and_promote_blob(
         self, 
@@ -40,7 +48,7 @@ class GCSService(BaseService):
         dest_bucket_setting: str, 
         dest_blob_name: str
     ) -> str:
-        """Copies draft skill to production bucket and returns the unique destination Generation ID."""
+        """Copies draft skill to production bucket and returns destination Generation ID."""
         source_bucket_name, _ = self.clean_gcs_bucket_and_prefix(source_bucket_setting)
         dest_bucket_name, _ = self.clean_gcs_bucket_and_prefix(dest_bucket_setting)
 

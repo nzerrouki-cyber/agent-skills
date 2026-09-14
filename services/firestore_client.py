@@ -1,8 +1,11 @@
 # services/firestore_client.py
 import time
+import logging
 from google.cloud import firestore
 from config.settings import settings
 from services.base_service import BaseService
+
+logger = logging.getLogger(__name__)
 
 
 class FirestoreClient(BaseService):
@@ -11,7 +14,37 @@ class FirestoreClient(BaseService):
         self.db = self.get_firestore_client()
         self.registry = self.db.collection(settings.FIRESTORE_REGISTRY_COLLECTION)
 
-    # Retrieve skill from Skill Index Registry by skill id
+    async def list_active_skills(self, category: str | None = None) -> list[dict]:
+        """Queries all active skills from the registry (Specification 1)."""
+        try:
+            if category:
+                query = self.registry.where(
+                    filter=firestore.FieldFilter("category", "==", category)
+                ).where(
+                    filter=firestore.FieldFilter("status", "==", "ACTIVE")
+                )
+            else:
+                query = self.registry.where(
+                    filter=firestore.FieldFilter("status", "==", "ACTIVE")
+                )
+            
+            docs = query.stream()
+            skills = []
+            async for doc in docs:
+                skills.append(doc.to_dict())
+            return skills
+        except Exception as e:
+            logger.warning(f"Composite query failed, falling back to client-side filtering: {str(e)}")
+            # Fallback for unbuilt composite indexes
+            docs = self.registry.stream()
+            skills = []
+            async for doc in docs:
+                data = doc.to_dict()
+                if data.get("status") == "ACTIVE":
+                    if not category or data.get("category") == category:
+                        skills.append(data)
+            return skills
+
     async def get_active_skill_by_id(self, skill_id: str) -> dict | None:
         """Queries the Skill Registry directly by skill_id."""
         doc_ref = self.registry.document(skill_id)
@@ -22,9 +55,8 @@ class FirestoreClient(BaseService):
                 return data
         return None
 
-    # Queries the skill by the target_datastore_id as a fallback
     async def get_active_skill_by_datastore(self, datastore_id: str) -> dict | None:
-        """Queries the Skill Registry for worker skills bound to target_datastore_id with fallback handling."""
+        """Queries the Skill Registry for worker skills bound to target_datastore_id."""
         try:
             query = self.registry.where(
                 filter=firestore.FieldFilter("target_datastore_id", "==", datastore_id)
@@ -35,7 +67,6 @@ class FirestoreClient(BaseService):
             async for doc in docs:
                 return doc.to_dict()
         except Exception:
-            # Single-field query fallback if composite index is not yet built
             query = self.registry.where(
                 filter=firestore.FieldFilter("target_datastore_id", "==", datastore_id)
             )
@@ -46,7 +77,6 @@ class FirestoreClient(BaseService):
                     return data
         return None
 
-    # Queries for the skill based on category
     async def get_active_skill_by_category(self, category: str) -> dict | None:
         """Queries the Skill Registry by category."""
         query = self.registry.where(
@@ -59,7 +89,6 @@ class FirestoreClient(BaseService):
             return doc.to_dict()
         return None
 
-    # Default method to retrieve skill by skill_id
     async def get_active_skill(self, identifier: str) -> dict | None:
         """Dual-lookup helper checking skill_id first, falling back to category."""
         record = await self.get_active_skill_by_id(identifier)
@@ -67,8 +96,8 @@ class FirestoreClient(BaseService):
             return record
         return await self.get_active_skill_by_category(identifier)
 
-    # Inserts a new skill_id i.e index within the Skill Index Registry
     async def upsert_skill_registry_index(self, skill_data: dict) -> None:
+        """Inserts or updates a skill in the Skill Registry index."""
         skill_id = skill_data["skill_id"]
         doc_ref = self.registry.document(skill_id)
         payload = {

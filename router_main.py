@@ -1,38 +1,52 @@
 # router_main.py
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Depends
 from agents.intake_agent import IntakeAgent
 from agents.discovery_agent import DiscoveryAgent
 from agents.validation_agent import SkillValidationAgent
 from agents.gem_creator_agent import GemCreatorAgent
-from agents.worker_agent import WorkerAgent
-from models.schemas import TaskPayload
+from models.schemas import TaskPayload, AisleSkill
 from services.session_store import SessionStoreService
+from services.gcs_service import GCSService
+from services.core_service import CoreWorkflowService
+from services.cloud_run_jobs import CloudRunJobsClient
+from utils.security import verify_cloud_tasks_oidc_token
 from config.settings import settings
 
 # Runs a FastAPI application that ois hoted in GKE pods. 
 # This routes the appropriate WebSocket connections through the correct agents and eventarc triggers.
 app = FastAPI(title="Enterprise Agentic Workflow - Router Service", version="1.0.0")
 
-# Instantiate agents. 
+# Instantiate agents & clients
 intake_agent = IntakeAgent()
 discovery_agent = DiscoveryAgent()
 validation_agent = SkillValidationAgent()
 gem_creator_agent = GemCreatorAgent()
+gcs_service = GCSService()
+cloud_run_jobs_client = CloudRunJobsClient()
 
-# Checks router microserve is healthy.
 @app.get("/health")
 async def health_check():
     """Health check probe endpoint."""
     return {"status": "healthy"}
 
-    # ---------------------------------------------------------
-    # SKILL LifeCycle
-    # ---------------------------------------------------------
+# ---------------------------------------------------------
+# Skill Discovery & Specification Features
+# ---------------------------------------------------------
 
+@app.get("/skills")
+async def list_available_skills(category: str | None = None):
+    """Specification 1: Endpoint to retrieve all active available skills from the registry."""
+    core_service = CoreWorkflowService()
+    skills = await core_service.list_available_skills(category=category)
+    return {"status": "SUCCESS", "count": len(skills), "skills": skills}
+
+# ---------------------------------------------------------
+# SKILL LifeCycle
+# ---------------------------------------------------------
 # 1. Create session for Gem Creater Agent to add new skills.
 @app.websocket("/ws/gem-creator/{session_id}")
 async def gem_creator_endpoint(websocket: WebSocket, session_id: str):
-    """Interactive guided loop (Steps 0-7) for authoring new skills."""
+    """Interactive guided loop for authoring new skills."""
     await websocket.accept()
     try:
         while True:
@@ -56,7 +70,7 @@ async def validate_draft_skill(request: Request):
 async def create_skill_draft(skill: AisleSkill):
     """Direct REST ingestion endpoint for registering new AisleSkill drafts."""
     formatted_markdown = skill.to_yaml_markdown()
-    
+
     bucket_parts = settings.SKILL_DRAFTS_BUCKET.strip("/").split("/", 1)
     bucket_name = bucket_parts[0]
     prefix = bucket_parts[1] if len(bucket_parts) > 1 else ""
@@ -69,15 +83,14 @@ async def create_skill_draft(skill: AisleSkill):
         content_type="text/markdown"
     )
     return {
-        "status": "SUCCESS", 
-        "skill_id": skill.skill_id, 
+        "status": "SUCCESS",
+        "skill_id": skill.skill_id,
         "gcs_path": f"gs://{bucket_name}/{blob_path}"
     }
 
-    # ---------------------------------------------------------
-    # Intake Form Agentic Process
-    # ---------------------------------------------------------
-
+# ---------------------------------------------------------
+# Intake Form Agentic Process
+# ---------------------------------------------------------
 # 1. Create session for intake agent to fill intake form.
 @app.websocket("/ws/intake/{session_id}")
 async def intake_chat_endpoint(websocket: WebSocket, session_id: str):
@@ -98,7 +111,7 @@ async def finalize_intake(session_id: str):
     session_store = SessionStoreService(collection_name=settings.FIRESTORE_INTAKE_SESSION_STORE)
     session = await session_store.get_session(session_id)
     return {
-        "session_id": session_id, 
+        "session_id": session_id,
         "status": session.status,
         "collected_fields": session.collected_fields
     }
@@ -113,8 +126,16 @@ async def route_intake_payload(request: Request):
 
 #4. Execute the worker's system prompt by retrieving the skill payload.
 @app.post("/worker/{target_datastore_id}")
-async def execute_worker_task(target_datastore_id: str, payload: TaskPayload):
-    """Worker endpoint invoked asynchronously by Cloud Tasks."""
-    worker = WorkerAgent(category=target_datastore_id)
-    result = await worker.execute_task(payload)
-    return {"status": "SUCCESS", "result": result}
+async def dispatch_worker_job(
+    target_datastore_id: str,
+    payload: TaskPayload,
+    auth_claims: dict = Depends(verify_cloud_tasks_oidc_token)
+):
+    """Worker task dispatch endpoint invoked asynchronously by Cloud Tasks.
+    Launches an ephemeral Cloud Run Job instance."""
+    operation_name = await cloud_run_jobs_client.trigger_worker_job(payload.model_dump())
+    return {
+        "status": "JOB_DISPATCHED",
+        "target_datastore_id": target_datastore_id,
+        "operation": operation_name
+    }

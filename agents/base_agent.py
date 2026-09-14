@@ -9,6 +9,7 @@ from services.gcs_service import GCSService
 from services.firestore_client import FirestoreClient
 from services.redis_cache import WorkerRedisCache
 
+
 class BaseAgent:
     """Abstract Base Agent providing shared GCP clients, YAML frontmatter manipulation, 
     metadata parsing, and prompt loading utilities across all workflow agents."""
@@ -18,19 +19,26 @@ class BaseAgent:
         self.firestore = FirestoreClient()
         self.redis_cache = WorkerRedisCache()
 
-        # Centralized Vertex AI Gemini Client instantiation
-        self.genai_client = genai.Client(
-            vertexai=True,
-            project=settings.PROJECT_ID,
-            location=settings.REGION,
-        )
+        # Centralized Vertex AI Gemini Client instantiation with optional Apigee Gateway support
+        client_args = {
+            "vertexai": True,
+            "project": settings.PROJECT_ID,
+            "location": settings.REGION,
+        }
+
+        if settings.APIGEE_GATEWAY_URL:
+            client_args["http_options"] = types.HttpOptions(
+                base_url=settings.APIGEE_GATEWAY_URL,
+                headers={"x-api-key": settings.APIGEE_API_KEY} if settings.APIGEE_API_KEY else {}
+            )
+
+        self.genai_client = genai.Client(**client_args)
 
     # ---------------------------------------------------------
     # Shared GCS & Registry Helpers
     # ---------------------------------------------------------
 
     @staticmethod
-    # Extracts the event payload and GCS bucket information when running eventarc triggers.
     def extract_gcs_event_data(event_payload: dict) -> tuple[str, str]:
         """Unwraps bucket name and object blob name from raw GCS notifications and Eventarc CloudEvents."""
         data = event_payload.get("data", event_payload)
@@ -42,7 +50,6 @@ class BaseAgent:
 
         return bucket, name
 
-    # Retrieve a validated skill from the Production GCS / Redis Cache (if cached)
     async def get_promoted_skill_prompt(self, identifier: str) -> tuple[str, str, str]:
         """Fetches active skill prompt from Redis cache or Production GCS using dual lookup."""
         skill_record = await self.firestore.get_active_skill(identifier)
@@ -50,7 +57,7 @@ class BaseAgent:
             raise ValueError(f"No active skill found in registry for: '{identifier}'")
 
         skill_id = skill_record["skill_id"]
-        generation_id = skill_record["generation_id"]
+        generation_id = str(skill_record["generation_id"])
         gcs_uri = skill_record["gcs_uri"]
 
         cached_prompt = await self.redis_cache.get_skill(skill_id, generation_id)
@@ -98,7 +105,6 @@ class BaseAgent:
             return match.group(1).strip()
         return clean
 
-    # Inject YAML metadata within skills
     def inject_yaml_frontmatter(
         self,
         skill_id: str,
@@ -114,7 +120,6 @@ class BaseAgent:
         active_version: str = "1.0.0",
         status: str = "DRAFT"
     ) -> str:
-        # Injects standardized YAML frontmatter adhering to the AisleSkill specification.
         if not target_datastore_id or target_datastore_id.strip() in ["", "default-ds"]:
             raise ValueError(
                 f"Cannot inject YAML frontmatter for skill '{skill_id}': "

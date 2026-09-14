@@ -5,6 +5,7 @@ from models.schemas import TaskPayload
 from services.cloud_tasks import CloudTasksClient
 from services.model_armor import ModelArmorClient
 
+
 class DiscoveryAgent(BaseAgent):
     """Event-driven routing agent using AisleSkill metadata for registry lookups."""
 
@@ -13,7 +14,6 @@ class DiscoveryAgent(BaseAgent):
         self.task_queue = CloudTasksClient()
         self.model_armor = ModelArmorClient()
 
-    # Emits an eventarc trigger after an intake is added, discoveyr agent retrieves skil and enqueues task for the worker agent.
     async def process_and_enqueue(self, event_payload: dict):
         """Processes Eventarc GCS events, runs security checks, resolves active skills, and enqueues tasks."""
         bucket, name = self.extract_gcs_event_data(event_payload)
@@ -53,7 +53,7 @@ class DiscoveryAgent(BaseAgent):
             intake_content=sanitized.clean_text
         )
 
-        # 5. Dispatch to Cloud Tasks worker queue
+        # 5. Dispatch to Cloud Tasks queue targeting worker execution endpoint
         await self.task_queue.enqueue_worker_task(
             endpoint_route=f"/worker/{payload.target_datastore_id}",
             payload=payload.model_dump()
